@@ -6,7 +6,12 @@ using System.Linq;
 using System.Net;
 using System.Web;
 using System.Web.Mvc;
+using System.Configuration;
+using StackExchange.Redis;
+using System.Diagnostics;
+using Newtonsoft.Json;
 using azure_redis_cache_web_mvc_app.Models;
+
 
 namespace azure_redis_cache_web_mvc_app.Controllers
 {
@@ -14,10 +19,242 @@ namespace azure_redis_cache_web_mvc_app.Controllers
     {
         private TeamContext db = new TeamContext();
 
-        // GET: Teams
-        public ActionResult Index()
+        // Redis Connection string info
+        private static Lazy<ConnectionMultiplexer> lazyConnection = new Lazy<ConnectionMultiplexer>(() =>
         {
-            return View(db.Teams.ToList());
+
+#if AZURE_ENV
+            //https://docs.microsoft.com/zh-cn/azure/redis-cache/cache-web-app-howto
+            //string configurationOptions = ConfigurationManager.AppSettings["CacheConnection"].ToString();
+
+            var configurationOptions = new ConfigurationOptions
+            {
+                EndPoints =
+            {
+                { "cachesojr2cfrqdmzw.redis.cache.windows.net",6379 }
+            },
+                KeepAlive = 180,
+                Password = "p+hzMnIxqlshQZx0G6HX5LfMJjmvulIg9MStPc59DXY=",
+                // Needed for cache clear
+                AllowAdmin = true
+            };
+
+#else
+            var configurationOptions = new ConfigurationOptions
+            {
+                EndPoints =
+                            {
+                                { "192.168.0.104",6379 }
+                            },
+                KeepAlive = 180,
+                // Needed for cache clear
+                AllowAdmin = true
+            };
+
+#endif
+            return ConnectionMultiplexer.Connect(configurationOptions);
+
+
+
+
+  
+
+
+
+        });
+
+        public static ConnectionMultiplexer Connection
+        {
+            get
+            {
+                return lazyConnection.Value;
+            }
+        }
+
+        void ClearCachedTeams()
+        {
+            IDatabase cache = Connection.GetDatabase();
+            cache.KeyDelete("teamsList");
+            cache.KeyDelete("teamsSortedSet");
+            ViewBag.msg += "Team data removed from cache. ";
+        }
+
+        void PlayGames()
+        {
+            ViewBag.msg += "Updating team statistics. ";
+            // Play a "season" of games.
+            var teams = from t in db.Teams
+                        select t;
+
+            Team.PlayGames(teams);
+
+            db.SaveChanges();
+
+            // Clear any cached results
+            ClearCachedTeams();
+        }
+
+
+        void RebuildDB()
+        {
+            ViewBag.msg += "Rebuilding DB. ";
+            // Delete and re-initialize the database with sample data.
+            db.Database.Delete();
+            db.Database.Initialize(true);
+
+            // Clear any cached results
+            ClearCachedTeams();
+        }
+
+
+        List<Team> GetFromDB()
+        {
+            ViewBag.msg += "Results read from DB. ";
+            var results = from t in db.Teams
+                          orderby t.Wins descending
+                          select t;
+
+            return results.ToList<Team>();
+        }
+
+        List<Team> GetFromList()
+        {
+            List<Team> teams = null;
+
+            IDatabase cache = Connection.GetDatabase();
+            string serializedTeams = cache.StringGet("teamsList");
+            if (!String.IsNullOrEmpty(serializedTeams))
+            {
+                teams = JsonConvert.DeserializeObject<List<Team>>(serializedTeams);
+
+                ViewBag.msg += "List read from cache. ";
+            }
+            else
+            {
+                ViewBag.msg += "Teams list cache miss. ";
+                // Get from database and store in cache
+                teams = GetFromDB();
+
+                ViewBag.msg += "Storing results to cache. ";
+                cache.StringSet("teamsList", JsonConvert.SerializeObject(teams));
+            }
+            return teams;
+        }
+
+
+        List<Team> GetFromSortedSet()
+        {
+            List<Team> teams = null;
+            IDatabase cache = Connection.GetDatabase();
+            // If the key teamsSortedSet is not present, this method returns a 0 length collection.
+            var teamsSortedSet = cache.SortedSetRangeByRankWithScores("teamsSortedSet", order: Order.Descending);
+            if (teamsSortedSet.Count() > 0)
+            {
+                ViewBag.msg += "Reading sorted set from cache. ";
+                teams = new List<Team>();
+                foreach (var t in teamsSortedSet)
+                {
+                    Team tt = JsonConvert.DeserializeObject<Team>(t.Element);
+                    teams.Add(tt);
+                }
+            }
+            else
+            {
+                ViewBag.msg += "Teams sorted set cache miss. ";
+
+                // Read from DB
+                teams = GetFromDB();
+
+                ViewBag.msg += "Storing results to cache. ";
+                foreach (var t in teams)
+                {
+                    Console.WriteLine("Adding to sorted set: {0} - {1}", t.Name, t.Wins);
+                    cache.SortedSetAdd("teamsSortedSet", JsonConvert.SerializeObject(t), t.Wins);
+                }
+            }
+            return teams;
+        }
+
+        List<Team> GetFromSortedSetTop5()
+        {
+            List<Team> teams = null;
+            IDatabase cache = Connection.GetDatabase();
+
+            // If the key teamsSortedSet is not present, this method returns a 0 length collection.
+            var teamsSortedSet = cache.SortedSetRangeByRankWithScores("teamsSortedSet", stop: 4, order: Order.Descending);
+            if (teamsSortedSet.Count() == 0)
+            {
+                // Load the entire sorted set into the cache.
+                GetFromSortedSet();
+
+                // Retrieve the top 5 teams.
+                teamsSortedSet = cache.SortedSetRangeByRankWithScores("teamsSortedSet", stop: 4, order: Order.Descending);
+            }
+
+            ViewBag.msg += "Retrieving top 5 teams from cache. ";
+            // Get the top 5 teams from the sorted set
+            teams = new List<Team>();
+            foreach (var team in teamsSortedSet)
+            {
+                teams.Add(JsonConvert.DeserializeObject<Team>(team.Element));
+            }
+            return teams;
+        }
+
+
+
+        // GET: Teams
+        public ActionResult Index(string actionType, string resultType)
+        {
+            //return View(db.Teams.ToList());
+
+            List<Team> teams = null;
+
+            switch (actionType)
+            {
+                case "playGames": // Play a new season of games.
+                    PlayGames();
+                    break;
+
+                case "clearCache": // Clear the results from the cache.
+                    ClearCachedTeams();
+                    break;
+
+                case "rebuildDB": // Rebuild the database with sample data.
+                    RebuildDB();
+                    break;
+            }
+
+            // Measure the time it takes to retrieve the results.
+            Stopwatch sw = Stopwatch.StartNew();
+
+            switch (resultType)
+            {
+                case "teamsSortedSet": // Retrieve teams from sorted set.
+                    teams = GetFromSortedSet();
+                    break;
+
+                case "teamsSortedSetTop5": // Retrieve the top 5 teams from the sorted set.
+                    teams = GetFromSortedSetTop5();
+                    break;
+
+                case "teamsList": // Retrieve teams from the cached List<Team>.
+                    teams = GetFromList();
+                    break;
+
+                case "fromDB": // Retrieve results from the database.
+                default:
+                    teams = GetFromDB();
+                    break;
+            }
+
+            sw.Stop();
+            double ms = sw.ElapsedTicks / (Stopwatch.Frequency / (1000.0));
+
+            // Add the elapsed time of the operation to the ViewBag.msg.
+            ViewBag.msg += " MS: " + ms.ToString();
+
+            return View(teams);
         }
 
         // GET: Teams/Details/5
@@ -52,6 +289,9 @@ namespace azure_redis_cache_web_mvc_app.Controllers
             {
                 db.Teams.Add(team);
                 db.SaveChanges();
+                // When a team is added, the cache is out of date.
+                // Clear the cached teams.
+                ClearCachedTeams();
                 return RedirectToAction("Index");
             }
 
@@ -84,6 +324,9 @@ namespace azure_redis_cache_web_mvc_app.Controllers
             {
                 db.Entry(team).State = EntityState.Modified;
                 db.SaveChanges();
+                // When a team is edited, the cache is out of date.
+                // Clear the cached teams.
+                ClearCachedTeams();
                 return RedirectToAction("Index");
             }
             return View(team);
@@ -112,6 +355,9 @@ namespace azure_redis_cache_web_mvc_app.Controllers
             Team team = db.Teams.Find(id);
             db.Teams.Remove(team);
             db.SaveChanges();
+            // When a team is edited, the cache is out of date.
+            // Clear the cached teams.
+            ClearCachedTeams();
             return RedirectToAction("Index");
         }
 
